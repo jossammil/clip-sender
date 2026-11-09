@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CrowPanel Clip Sender</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2329; --muted: #66727f; --line: #dde2e7;
+    --accent: #e8643a; --accent-text: #ffffff; --ok: #2e8b57; --warn: #b7791f; --err: #c0392b;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0e1216; --panel: #161c22; --text: #e6ebef; --muted: #8b98a5; --line: #26303a;
+            --accent: #ff7043; --ok: #4caf50; --warn: #ffb703; --err: #ef5350; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; border-radius: 8px; border: 1px solid var(--line); background: var(--panel);
+           color: var(--text); padding: 8px 14px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: default; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.on { background: var(--ok); } .dot.busy { background: var(--warn); }
+  #status { flex: 1; min-width: 160px; }
+  textarea { width: 100%; min-height: 260px; resize: vertical; font: 13px/1.4 var(--mono); color: var(--text);
+             background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 6px; display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .warn { color: var(--warn); } .err { color: var(--err); } .ok { color: var(--ok); }
+  progress { width: 100%; height: 8px; accent-color: var(--accent); }
+  #codeBox { display: none; }
+  #codeBox input { font: 22px var(--mono); letter-spacing: 6px; width: 9.5em; padding: 6px 10px; text-align: center;
+                   border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); }
+  #unsupported { display: none; }
+  #log { font: 12px/1.4 var(--mono); color: var(--muted); white-space: pre-wrap; max-height: 140px; overflow: auto; margin: 0; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>CrowPanel Clip Sender</h1>
+  <p class="sub">Sends text to the board's CLIP inbox over Bluetooth. The board types it only when you press its knob.</p>
+
+  <div class="card" id="unsupported">
+    <strong class="err">This browser can't use Web Bluetooth.</strong>
+    <ul>
+      <li>Use Chrome or Edge on Windows, macOS, ChromeOS or Android.</li>
+      <li>On Linux, enable <code>chrome://flags/#enable-experimental-web-platform-features</code> and restart the browser.</li>
+      <li>On iPhone or iPad, open this page in the Bluefy browser.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <span class="dot" id="dot"></span>
+      <span id="status">Not connected</span>
+      <button class="primary" id="connectBtn">Connect</button>
+      <button id="disconnectBtn" disabled>Disconnect</button>
+    </div>
+    <div id="codeBox" style="margin-top:14px">
+      <p style="margin:0 0 8px">The board is showing a 6-digit code. Enter it to allow this browser to send (asked once).</p>
+      <div class="row">
+        <input id="codeInput" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="000000">
+        <button class="primary" id="codeBtn">Allow</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <textarea id="text" placeholder="Paste or type the text to send"></textarea>
+    <div class="meta"><span id="count">0 characters</span><span id="charWarn"></span></div>
+    <div class="row" style="margin-top:12px">
+      <button id="pasteBtn">Paste clipboard</button>
+      <button id="clearBtn">Clear</button>
+      <span style="flex:1"></span>
+      <button class="primary" id="sendBtn" disabled>Send to board</button>
+    </div>
+    <div style="margin-top:12px"><progress id="progress" max="100" value="0" hidden></progress></div>
+    <div id="result" class="meta"></div>
+  </div>
+
+  <details class="card">
+    <summary>Log</summary>
+    <pre id="log"></pre>
+  </details>
+</main>
+
+<script>
+"use strict";
+const SVC = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+const TX  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+const INBOX_MAX = 256 * 1024;
+const TOKEN_KEY = "crowpanel-clip-token";
+
+const $ = (id) => document.getElementById(id);
+let device = null, rx = null, mtu = 23, authorized = false;
+let waiters = [];
+
+function log(msg) {
+  const el = $("log");
+  el.textContent += `${new Date().toLocaleTimeString()}  ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function setStatus(text, state) {
+  $("status").textContent = text;
+  $("dot").className = "dot" + (state ? " " + state : "");
+}
+
+// Set an element's content to one styled span (textContent, so messages can't inject markup).
+function showMsg(el, cls, text, extra = "") {
+  const span = document.createElement("span");
+  span.className = cls;
+  span.textContent = text;
+  el.replaceChildren(span, document.createTextNode(extra));
+}
+
+function storeGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function storeSet(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode: ask again next time */ } }
+
+// Replies from the board arrive as notifications; wait for one matching a predicate.
+function onReply(ev) {
+  const text = new TextDecoder().decode(ev.target.value);
+  log("board: " + text);
+  const pending = waiters;
+  waiters = [];
+  for (const w of pending) {
+    if (w.match(text)) { w.resolve(text); } else { waiters.push(w); }
+  }
+}
+
+function waitFor(match, ms = 8000) {
+  return new Promise((resolve, reject) => {
+    const w = { match, resolve };
+    waiters.push(w);
+    setTimeout(() => { waiters = waiters.filter((x) => x !== w); reject(new Error("no reply from board")); }, ms);
+  });
+}
+
+async function command(text, match, ms) {
+  const p = waitFor(match, ms);
+  await rx.writeValueWithResponse(new Uint8Array([1, ...new TextEncoder().encode(text)]));
+  return p;
+}
+
+function gotReady(reply) {
+  const m = /^ready(?: (\d+))?/.exec(reply);
+  if (!m) return false;
+  mtu = m[1] ? parseInt(m[1], 10) : 23;
+  return true;
+}
+
+async function connect() {
+  if (!navigator.bluetooth) { $("unsupported").style.display = "block"; return; }
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SVC] }, { namePrefix: "CrowPanel" }],
+      optionalServices: [SVC],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+    setStatus("Connecting to " + (device.name || "board") + "...", "busy");
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SVC);
+    rx = await svc.getCharacteristic(RX);
+    const tx = await svc.getCharacteristic(TX);
+    tx.addEventListener("characteristicvaluechanged", onReply);
+    await tx.startNotifications();
+    $("disconnectBtn").disabled = false;
+    $("connectBtn").disabled = true;
+    await authorize();
+  } catch (e) {
+    log("connect failed: " + e.message);
+    setStatus("Connection failed: " + e.message, "");
+    if (/encrypt|authenticat|pair/i.test(e.message)) {
+      setStatus("Pairing needed: accept the system's pairing prompt, then connect again.", "");
+    }
+  }
+}
+
+async function authorize() {
+  const token = storeGet(TOKEN_KEY);
+  if (token) {
+    const r = await command("token " + token, (t) => /^(ready|badtoken)/.test(t));
+    if (gotReady(r)) return setAuthorized();
+  }
+  const r = await command("hello", (t) => /^(ready|code)/.test(t));
+  if (gotReady(r)) return setAuthorized();
+  setStatus("Enter the code shown on the board", "busy");
+  $("codeBox").style.display = "block";
+  $("codeInput").focus();
+}
+
+async function submitCode() {
+  const code = $("codeInput").value.trim();
+  if (!/^\d{6}$/.test(code)) { $("codeInput").focus(); return; }
+  const tokenP = waitFor((t) => t.startsWith("token "));
+  const r = await command("auth " + code, (t) => /^(ready|badcode)/.test(t));
+  if (r === "badcode") {
+    setStatus("Wrong code. Check the board (it may show a new one) and try again.", "busy");
+    $("codeInput").select();
+    tokenP.catch(() => {});
+    return;
+  }
+  const tok = await tokenP.catch(() => null);
+  if (tok) storeSet(TOKEN_KEY, tok.slice(6).trim());
+  gotReady(r);
+  $("codeBox").style.display = "none";
+  $("codeInput").value = "";
+  setAuthorized();
+}
+
+function setAuthorized() {
+  authorized = true;
+  setStatus("Connected to " + (device.name || "board") + " - ready to send", "on");
+  updateSend();
+}
+
+function onDisconnected() {
+  authorized = false;
+  rx = null;
+  waiters = [];
+  setStatus("Disconnected", "");
+  $("codeBox").style.display = "none";
+  $("connectBtn").disabled = false;
+  $("disconnectBtn").disabled = true;
+  updateSend();
+}
+
+// Characters a US keyboard can type: printable ASCII, tab, newline (CR is folded into newlines).
+function untypeable(text) {
+  const bad = new Map();
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    if ((c >= 0x20 && c < 0x7f) || c === 9 || c === 10 || c === 13) continue;
+    bad.set(ch, (bad.get(ch) || 0) + 1);
+  }
+  return bad;
+}
+
+function updateCount() {
+  const text = $("text").value;
+  const bytes = new TextEncoder().encode(text).length;
+  const lines = text ? text.split("\n").length : 0;
+  $("count").textContent = `${text.length.toLocaleString()} characters, ${lines.toLocaleString()} lines` +
+    (bytes > INBOX_MAX ? ` - only the first 256 KB fits` : "");
+  const bad = untypeable(text);
+  if (bad.size) {
+    const n = [...bad.values()].reduce((a, b) => a + b, 0);
+    const sample = [...bad.keys()].slice(0, 8).map((c) => JSON.stringify(c)).join(" ");
+    showMsg($("charWarn"), "warn", `${n} character${n > 1 ? "s" : ""} can't be typed and will be skipped: ${sample}`);
+  } else {
+    $("charWarn").textContent = "";
+  }
+  updateSend();
+}
+
+function updateSend() {
+  $("sendBtn").disabled = !(authorized && $("text").value.length);
+}
+
+async function sendOnce(data, fast) {
+  const begin = await command("begin", (t) => /^(recv|busy|need-auth)/.test(t));
+  if (begin === "busy") throw new Error("the board is busy typing - try again when it's done");
+  if (begin !== "recv") throw new Error("not authorized");
+  const chunk = fast ? Math.max(20, mtu - 4) : 180;
+  let n = 0;
+  for (let i = 0; i < data.length; i += chunk) {
+    const frame = new Uint8Array(Math.min(chunk, data.length - i) + 1);
+    frame[0] = 2;
+    frame.set(data.subarray(i, i + chunk), 1);
+    n++;
+    // Unacknowledged writes are fast; an acknowledged one every 32 keeps the browser's queue short.
+    if (fast && n % 32 !== 0) { await rx.writeValueWithoutResponse(frame); }
+    else { await rx.writeValueWithResponse(frame); }
+    if (n % 8 === 0) $("progress").value = Math.round(100 * (i + chunk) / data.length);
+  }
+  const end = await command("end", (t) => t.startsWith("ok"), 60000);
+  return parseInt(end.split(" ")[1], 10);
+}
+
+async function send() {
+  let data = new TextEncoder().encode($("text").value);
+  if (data.length > INBOX_MAX) data = data.subarray(0, INBOX_MAX);
+  $("sendBtn").disabled = true;
+  $("progress").hidden = false;
+  $("progress").value = 0;
+  $("result").textContent = "";
+  const t0 = performance.now();
+  try {
+    let got = await sendOnce(data, true);
+    if (got !== data.length) {
+      log(`fast transfer incomplete (${got}/${data.length}); retrying with acknowledged writes`);
+      got = await sendOnce(data, false);
+    }
+    const secs = ((performance.now() - t0) / 1000).toFixed(1);
+    $("progress").value = 100;
+    if (got === data.length) {
+      showMsg($("result"), "ok", `Sent ${got.toLocaleString()} bytes in ${secs}s.`, " Press the knob in CLIP mode to type it.");
+    } else {
+      showMsg($("result"), "err", `The board received ${got} of ${data.length} bytes. Try again.`);
+    }
+  } catch (e) {
+    log("send failed: " + e.message);
+    showMsg($("result"), "err", "Send failed: " + e.message);
+  } finally {
+    updateSend();
+  }
+}
+
+$("connectBtn").onclick = connect;
+$("disconnectBtn").onclick = () => device && device.gatt.connected && device.gatt.disconnect();
+$("codeBtn").onclick = () => submitCode().catch((e) => log("auth failed: " + e.message));
+$("codeInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("codeBtn").click(); });
+$("sendBtn").onclick = send;
+$("text").addEventListener("input", updateCount);
+$("clearBtn").onclick = () => { $("text").value = ""; updateCount(); };
+$("pasteBtn").onclick = async () => {
+  try { $("text").value = await navigator.clipboard.readText(); updateCount(); }
+  catch (e) { log("clipboard read blocked: " + e.message + " (paste with Ctrl+V instead)"); $("text").focus(); }
+};
+if (!navigator.bluetooth) $("unsupported").style.display = "block";
+updateCount();
+</script>
+</body>
+</html>
